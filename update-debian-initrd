@@ -1,0 +1,302 @@
+#!/bin/bash
+
+# FIXME: this script kinda blows. the functions should be more orthogonal and 
+# provide functionality to pack and upack initrds because its very useful for 
+# debugging. Also, find a way to bootstrap late_command
+
+# This script builds an initrd based on Debian netboot media. Using this
+# script, you can add additional files and manipulate the installation 
+# environment to your needs. It is intended to be invoked on a pxe host to 
+# update binaries in /tftpboot on an as needed basis.
+#
+# At a future date
+# - http://kernel-handbook.alioth.debian.org/ch-initrd.html
+# - http://blog.edseek.com/archives/2004/03/22/creating-an-initrd-image-on-debian-gnulinux/
+
+# The shell option pipefail causes the return status of piped command to be greater
+# than zero if any command in the pipe fails.
+set -o pipefail
+
+# explicitly define the path for security/sanity
+export PATH="/bin:/usr/bin:/sbin:/usr/sbin:$PATH"
+
+function log() {
+ if [[ "${verbose}" == 'true' ]]; then
+    if [[ -n "${previousMessage}" ]]; then
+      echo -e "\e[0m--> ${previousMessage}\e[K";
+    fi
+    previousMessage=$@
+    echo -ne "\e[1m---> $@\r\e[0m"
+  fi
+} >&2
+
+function exit_with_error() {
+  if [[ "$@" ]]; then
+    echo "$0: $@"
+  fi
+  exit 1
+} >&2
+
+function exit_with_usage() {
+  echo "Usage: $(basename $0) [options...] <destination>
+
+OPTIONS
+  -d    Save work directory to aid in troubleshooting
+  -h    Print this information
+  -m    Debian mirror url (defaults to http://mirrors.kernel.org)
+  -v    Produce more visual feedback"
+
+  exit 1
+} >&2
+
+function check_dependencies() {
+  # add runtime dependencies here. Everything else should be a bash builtin, i.e 'echo'
+  local dependencies="ar basename chmod cp cpio curl cut dirname egrep find gzip head mkdir nc rm tar unlink wget zcat"
+
+  # What version of bash did 'type' get introduced?
+  for utility in ${dependencies}; do
+    if [[ "$(type ${utility} >/dev/null 2>&1; echo $?)" -ne '0' ]]; then
+      exit_with_error "Could not find ${utility}. Please verify that ${utility} is installed before running this script"
+    fi
+  done
+}
+
+function parse_arguments() {
+# Long options are embarassingly difficult in bash. I could implement 
+# parsing entirely in bash logic but it might be horrendously long and stupid
+#
+# GNU utilities support the following conventions:
+#
+# 1) -- terminates argument parsing
+# 2) options in any order and batched options 
+# 3) short and long options with mandatory --version and --help
+# 4) options with arguments
+# 5) non-option arguments  # default mirror
+
+  mirror='http://mirrors.kernel.org'
+
+  if [[ "$#" -gt '0' && ! "$1" =~ '^--.' ]]; then
+    # parse short options
+    while getopts 'dhm:v' option; do
+      case ${option} in
+        d)
+          debug=true
+          ;;
+        h)
+          exit_with_usage
+          ;;
+        m)
+          if [[ "$OPTARG" =~ '^(ftp|http):' ]]; then
+            mirror="$(echo $OPTARG | egrep -o '^(http|ftp)://[^/]+')" # store only the domain
+          else # not ftp or http
+            exit_with_error "Protocol \"${OPTARG%%:*}\" not supported"
+          fi
+          ;;
+        v)  
+          verbose=true
+          ;;  
+      esac
+    done
+
+    shift $(($OPTIND - 1))
+
+    if [[ "$1" =~ '^-.' || "$#" -ne '1' ]]; then
+      exit_with_usage
+    else
+      if [[ -w "$1" ]]; then # file exists and is writable
+        destination="$1"
+      else
+        exit_with_error "cannot write to $1"
+      fi
+    fi
+  else
+    exit_with_usage
+  fi
+
+#  echo debug: $debug 
+#  echo mirror: $mirror
+#  echo verbose: $verbose
+#  echo destination: $destination
+#  echo other: $@
+}
+
+function download_files() {
+  log "Downloading files"
+
+  if [[ -w "${workarea}" ]]; then # rare but oops, name collision
+    rm -rf "${workarea}"
+  fi
+
+  if [[ -w "$(dirname ${workarea})" ]]; then # workarea is writable
+    mkdir "${workarea}"
+  else
+    exit_with_error "Cannot write to $(dirname ${workarea})"
+  fi
+
+  # files on debian mirror
+  if [[ "${mirror}" =~ "^http" ]]; then # HTTP mirror
+    for file in ${firmware} ${initrd}; do
+      local HTTPStatus="$(curl -Is "${mirror}/${file}" | head -n1 | cut -d' ' -f2)"
+      if [[ "${HTTPStatus}" -lt '400' ]]; then
+        wget -q -O "${workarea}/$(basename ${file}).dist" "${mirror}/${file}" || exit_with_error "Unable to download ${mirror}/${file}"
+      else
+        exit_with_error "${mirror}/${file} returned HTTP status code ${HTTPStatus}"
+      fi
+    done
+  else
+    if  [[ "${mirror}" =~ "^ftp" ]]; then # FTP mirror
+      for file in ${firmware} ${initrd}; do
+        local FTPStatus="$(nc -w1 $(echo ${mirror} | cut -d/ -f3) 21 2>&1 | cut -d' ' -f1)"
+
+        if [[ "${FTPStatus}" -eq '220' ]]; then
+          wget -q -O "${workarea}/$(basename ${file}).dist" "${mirror}/${file}" || exit_with_error "Unable to download ${mirror}/${file}"
+        else
+          exit_with_error "${mirror} returned FTP return code ${FTPStatus}"
+        fi
+      done
+    fi 
+  fi
+
+  # files from ops repo
+  for file in ${wget} ${early_command} ${late_command}; do
+    local HTTPStatus="$(curl -Is "${repository}${file}" | head -n1 | cut -d' ' -f2)"
+
+    if [[ "${HTTPStatus}" -lt '400' ]]; then
+      wget -q -O "${workarea}/$(basename ${file}).dist" "${repository}${file}" || exit_with_error "Unable to download ${repository}${file}"
+    else
+      exit_with_error "${repository}${file} returned HTTP status code ${HTTPStatus}"
+    fi
+  done
+}
+
+function patch_image() {
+  log "Patching initrd"
+ 
+  local destroot="${workarea}/destroot"
+  mkdir "${destroot}"
+
+  ############
+  ## UNPACK ##
+  ############
+
+  # cpio doesn't have a way to specify output directory
+  # - http://www.mail-archive.com/bug-cpio@gnu.org/msg00363.html
+
+  zcat "${workarea}/$(basename ${initrd}).dist" | ( cd "${destroot}" && cpio -i ) 2>/dev/null || \
+    exit_with_error "Unable to unpack $(basename ${initrd})"
+
+  ################
+  ## ADD FILES  ##
+  ################ 
+
+  # .deb pkgs are "ar" archives (like /usr/lib/*.a) and the files are in a 
+  # member of that archive called "data.tar.gz" which is itself a standard 
+  # gzipped tar
+
+  ar -p "${workarea}/$(basename ${firmware}.dist)" data.tar.gz | tar -zxC "${destroot}" || \
+    exit_with_error "Unable to extract $(basename ${firmware})"
+  
+  # We implant a wrapper for wget so that we can pass arbitrary information
+  # about the seed-ing system in the User-Agent header to the httpd
+  # that is serving the preseed config. We need a unique identifier of a
+  # seed-ing system so we can dynamically build and serve a preseed.cfg based 
+  # on the needs of the system making the request.
+
+  if [[ -L "${destroot}/usr/bin/wget" ]]; then
+    unlink "${destroot}/usr/bin/wget" || exit_with_error "Unable to unlink wget alias in the initrd"
+    cp "${workarea}/$(basename ${wget}).dist" "${destroot}/usr/bin/wget" || exit_with_error "Unable to copy $(basename ${wget}) to workarea" 
+    chmod 755 "${destroot}/usr/bin/wget" || exit_with_error "Unable to chmod $(basename ${wget})"
+  else
+    exit_with_error "Symbolic link /usr/bin/wget does not exist in $(basename ${initrd}). Has the debian-installer drastically changed?"
+  fi
+  
+  # Instead of maintaining a very long late_command line in our preseed file,
+  # we coalesce the commands into a late_command.sh script
+  
+  # These might be better implemented as scripts that bootstrap themselves.
+  # That way we could quickly iterate on early and late commands without being
+  # forced to rebuild the initrd for every test
+ 
+  if [[ -e "${destroot}/sbin/" ]]; then
+    cp "${workarea}/$(basename ${late_command}).dist" "${destroot}/sbin/late_command" || exit_with_error "Unable to copy $(basename ${late_command}) to workarea"
+    chmod 755 "${destroot}/sbin/late_command" || exit_with_error "Unable to chmod $(basename ${late_command})"
+  else
+    exit_with_error "/sbin does not exist in $(basename ${initrd}). Has the debian-installer drastically changed?"
+  fi
+
+  # Instead of maintaining a very long early_command line in our preseed file,
+  # we coalesce the commands into a early_command.sh script
+
+  if [[ -e "${destroot}/sbin/" ]]; then
+    cp "${workarea}/$(basename ${early_command}).dist" "${destroot}/sbin/early_command" || exit_with_error "Unable to copy $(basename ${early_command}) to workarea"
+    chmod 755 "${destroot}/sbin/early_command" || exit_with_error "Unable to chmod $(basename ${early_command})"
+  else
+    exit_with_error "/sbin does not exist in $(basename ${initrd}). Has the debian-installer drastically changed?"
+  fi
+  
+  ##################
+  ## REMOVE FILES ##
+  ##################
+
+  ############
+  ## REPACK ##
+  ############
+
+  ( cd "${destroot}" && find . -print0 | cpio -0 -H newc -o 2>/dev/null ) | \
+    gzip -c > "${workarea}/$(basename ${initrd}).patched" || \
+    exit_with_error "Unable to repack $(basename ${initrd})"
+}
+
+function stage_files() {
+  # this is silly and too monolithic. in the revision tell the user to update the kernel too.
+  log "Copying initrd to ${destination}"
+
+  # Move files from workarea to their final destination
+  cp "${workarea}/$(basename ${initrd}.patched)" "${destination}/$(basename ${initrd})" || \
+    exit_with_error "Unable to copy $(basename ${initrd}) to ${destination}/$(basename ${initrd})"
+}
+
+function cleanup() {
+ if [[ -e "${workarea}" ]]; then # if we're far enough in the script where workarea has been created
+   if [[ "${debug}" == 'true' ]];  then
+     log "Workarea saved to ${workarea}"
+     log "Done\n"
+   else
+     rm -rf "${workarea}"
+     log "Done\n"
+   fi
+ fi
+}
+
+workarea="${TMPDIR:-/tmp}/$(basename $0).$$"
+
+## There are two locations for the initrd. kernel.org has releases and debian.org has daily builds.
+# - http://mirrors.kernel.org/debian/dists/squeeze/main/installer-amd64/
+# - http://d-i.debian.org/daily-images/amd64/
+# Path to squeeze netboot installer
+initrd='debian/dists/squeeze/main/installer-amd64/current/images/netboot/debian-installer/amd64/initrd.gz'
+
+# usb
+module="${workarea}/destroot/lib/modules/2.6.32-5-amd64/kernel/drivers/usb/storage/usb-storage.ko"
+
+# Path to bnx2 network card firmware
+#
+# Unfortunately theres no generic 'current' link, and old releases are
+# removed, so this will need to be updated when the package is updated
+#
+# - http://wiki.debian.org/DebianInstaller/NetbootFirmware
+firmware='debian/pool/non-free/f/firmware-nonfree/firmware-bnx2_0.28_all.deb'
+
+# These are ops maintained files for the initrd
+repository='http://git.dev.sixapart.com/?p=ops.git;a=blob_plain;f='
+wget='apps/debian-deployment/wget.sh'
+early_command='apps/debian-deployment/early_command.sh'
+late_command='apps/debian-deployment/late_command.sh'
+
+trap "cleanup" EXIT HUP INT QUIT TERM
+
+check_dependencies
+parse_arguments "$@"
+download_files
+patch_image
+stage_files
