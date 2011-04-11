@@ -1,0 +1,57 @@
+One of the first lengthy scripts I wrote at 6a. At the time I was proud of it
+but looking back now and see nothing but monolithic design and subsequently
+brittle code. The argument parsing is pretty robust for bash but otherwise 
+it's really just a study. One that I'm not neccesarily proud of. 
+
+Fortunately this is still a problem that's interesting to solve so a revision
+should come soon. I've done some thinking on its design so what follows are 
+just notes to myself. Enjoy being inside my head, I like it here, it's warm.
+
+-------------------------------------------------------------------------------
+
+After toying around with a few different "usage" messages, I realized what I
+was trying to solve, was underlying design pattern and it really required 
+thinking like an uninformed operator; my future self. How would I actually want
+to use this program? The Rule of Least Surprise was what was going through my 
+head.
+
+I began with something like:
+
+  Usage: ./script <src> <initrd>
+
+Where "source" is a directory which contains a FHS directory structure to be 
+injected into the initrd and the output is placed in the directory where the 
+script is executed.
+
+This seems good but has a few limitations, namely, how do you remove files?
+
+Essentially there are elemental operations that one wishes to perform on an
+initrd. These are as simple as "add" and "remove".
+
+It occured to me that perhaps the best way to solve this was to pass the script
+a text file with "src" "dest" and operands but the idea of implementing a
+DSL and parser in bash is really unattractive, not to mention outside the scope
+of this deceptively simple problem. And who wants to modify a text file to
+perform a simple change. Might as well hardcode it in the...Okay, terrible idea
+
+While discussing the "src" and "dest" design pattern so familiar among Unix
+users, http://pegasus.pimpninjas.org had an excellent idea.
+
+< pegasus> as for adding/removing/replacing files from a preexisting initrd
+< pegasus> there really isn't a standard for that
+< pegasus> oh, except
+< pegasus> scp
+< pegasus> scp /path/to/file host:/remote/path/to/file
+
+Ding. I love it.
+
+That gives us this:
+
+  Usage: ./script [option] <srcfile> initrd:/path/to/dest
+
+OPTIONS
+  -r    remove
+  ...   TBD
+
+It has occured to me that perhaps designing a program around its interface is a
+bad habbit but I like rooting for the underdog.
