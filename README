@@ -37,11 +37,11 @@ perform a simple change. Might as well hardcode it in the...Okay, terrible idea
 While discussing the "src" and "dest" design pattern so familiar among Unix
 users, http://pegasus.pimpninjas.org had an excellent idea.
 
-< pegasus> as for adding/removing/replacing files from a preexisting initrd
-< pegasus> there really isn't a standard for that
-< pegasus> oh, except
-< pegasus> scp
-< pegasus> scp /path/to/file host:/remote/path/to/file
+<pegasus> as for adding/removing/replacing files from a preexisting initrd
+<pegasus> there really isn't a standard for that
+<pegasus> oh, except
+<pegasus> scp
+<pegasus> scp /path/to/file host:/remote/path/to/file
 
 Ding. I love it.
 
